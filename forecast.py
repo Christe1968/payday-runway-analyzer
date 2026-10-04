@@ -12,7 +12,13 @@ from statistics import median, pstdev
 
 def _normalize(desc: str) -> str:
     s = desc.lower()
-    s = re.sub(r"\d{4,}", " ", s)          # order / auth numbers
+    # Strip per-occurrence fragments so recurring items group together:
+    # "authorized on 06/05", "on 06/10", "Ref # Wfct1294B388".
+    s = re.sub(r"ref #\s*\w+", " ", s)
+    s = re.sub(r"authorized on \d{1,2}/\d{1,2}", " ", s)
+    s = re.sub(r"\bon \d{1,2}/\d{1,2}\b", " ", s)
+    s = re.sub(r"\d{4,}", " ", s)          # order / auth / trace numbers
+    s = re.sub(r"\bx{2,}\b", " ", s)       # redaction noise: xxxxx, xxxxxx
     s = re.sub(r"[^a-z0-9 ]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
@@ -59,7 +65,9 @@ def _recurring_groups(transactions: list[dict], kind: str) -> list[dict]:
         amounts = [t["amount"] for t in txns]
         out.append(
             {
-                "name": max((t["description"] for t in txns), key=len).title(),
+                # Cleaned display name (no auth/trace numbers, no "Ref #…").
+                "name": norm.title(),
+                "norm": norm,
                 "amount": round(median(amounts), 2),
                 "cycle": label,
                 "interval_days": int(round(med)),
@@ -94,7 +102,10 @@ def build_profile(transactions: list[dict], ending_balance: float | None) -> dic
         )
 
     # Paycheck: biggest recurring credit, preferring biweekly/monthly.
-    credits = _recurring_groups(transactions, "credit")
+    # Internal transfers (savings hops, brokerage moves) are never paychecks.
+    credits = [
+        g for g in _recurring_groups(transactions, "credit") if "transfer" not in g["norm"]
+    ]
     paycheck = None
     if credits:
         ranked = sorted(
@@ -115,8 +126,11 @@ def build_profile(transactions: list[dict], ending_balance: float | None) -> dic
         warnings.append("No repeating paycheck pattern found — you can enter it manually.")
 
     # Recurring bills: recurring debits with a predicted next due date.
+    # Internal transfers are not bills.
     bills = []
     for g in _recurring_groups(transactions, "debit"):
+        if "transfer" in g["norm"]:
+            continue
         nxt = g["last_date"] + timedelta(days=g["interval_days"])
         bills.append(
             {
@@ -131,7 +145,11 @@ def build_profile(transactions: list[dict], ending_balance: float | None) -> dic
     if not bills:
         warnings.append("No recurring bills detected — add any manually.")
 
-    debits = [t["amount"] for t in transactions if t["kind"] == "debit"]
+    debits = [
+        t["amount"]
+        for t in transactions
+        if t["kind"] == "debit" and "transfer" not in _normalize(t["description"])
+    ]
     avg_daily_spend = round(sum(debits) / span_days, 2) if debits else 0.0
 
     return {

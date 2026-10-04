@@ -16,7 +16,7 @@ import uuid
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from parser import extract_text, parse_statement
+from parser import parse_pdf
 from forecast import build_profile
 
 app = Flask(__name__)
@@ -49,7 +49,7 @@ def analyze_statements():
         all_txns, balance, warnings = [], None, []
         for path in saved:
             try:
-                parsed = parse_statement(extract_text(path))
+                parsed = parse_pdf(path)
             except Exception:
                 warnings.append("One file could not be read and was skipped.")
                 continue

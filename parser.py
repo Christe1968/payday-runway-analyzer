@@ -1,43 +1,67 @@
 """
-Wells Fargo statement parser (v1).
+Wells Fargo statement parser (v2).
 
-Extracts transactions and the ending balance from Wells Fargo checking/savings
-statement PDFs. Written defensively: statement layouts drift, so several line
-patterns are tried and anything unrecognized is skipped rather than guessed.
+Real WF checking statements use ONE transaction table with separate columns:
+
+    Date | Number | Description | Deposits/Additions | Withdrawals/Subtractions | Ending daily balance
+
+Plain-text extraction loses the columns, so each transaction is classified by
+the *horizontal position* of its amount (pdfplumber word coordinates) relative
+to the Additions/Subtractions column headers. The trailing "ending daily
+balance" — printed on the last transaction of each day — is dropped, because
+the naive "last number on the line" approach mistakes it for the amount.
 
 Only Wells Fargo is supported in v1 — same scope as MyMoneyCycle today.
 """
 import re
 from datetime import datetime
 
-DATE_RE = r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?)"
-AMT_RE = r"(-?\$?\(?[\d,]+\.\d{2}\)?)"
-
-# A transaction line looks like:  10/01/26  SOME DESCRIPTION  1,840.00
-LINE_PATTERNS = [
-    re.compile(rf"^{DATE_RE}\s+(.+?)\s+{AMT_RE}\s*$"),
-    # Description-first variant seen in some exports
-    re.compile(rf"^(.+?)\s+{DATE_RE}\s+{AMT_RE}\s*$"),
-]
-
-DEPOSIT_HDR = re.compile(r"deposits?\s*(/|and)?\s*additions?", re.I)
-WITHDRAW_HDR = re.compile(r"withdrawals?\s*(/|and)?\s*subtractions?|deductions", re.I)
-BALANCE_RE = re.compile(r"ending balance\s+\$?([\d,]+\.\d{2})", re.I)
+AMT_WORD = re.compile(r"^\(?\$?[\d,]+\.\d{2}\)?$")
+DATE_WORD = re.compile(r"^(\d{1,2})/(\d{1,2})(?:/\d{2,4})?$")
+STMT_DATE_RE = re.compile(r"([A-Za-z]+ \d{1,2}, \d{4})\s+Page \d+ of \d+")
+BALANCE_RE = re.compile(r"ending balance(?: on \d{1,2}/\d{1,2})?\s+\$?([\d,]+\.\d{2})", re.I)
+BEGIN_RE = re.compile(r"beginning balance on (\d{1,2})/(\d{1,2})", re.I)
+END_RE = re.compile(r"ending balance on (\d{1,2})/(\d{1,2})", re.I)
 PERIOD_RE = re.compile(
     r"statement period:?\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:to|-|through)\s*(\d{1,2}/\d{1,2}/\d{2,4})",
     re.I,
 )
-# New-format section headers inside transaction history
-TX_HISTORY_HDR = re.compile(r"transaction history", re.I)
+
+CREDIT_HINTS = ("direct deposit", "zelle from", "transfer from")
+DEBIT_HINTS = ("zelle to", "transfer to")
 
 
-def _parse_amount(raw: str) -> float | None:
-    s = raw.strip().replace("$", "").replace(",", "")
+def _positioned_lines(pdf_path: str) -> list[list[dict]]:
+    """PDF -> pages -> lines -> pdfplumber word dicts (with x0/x1/top)."""
+    import pdfplumber
+
+    pages = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=2, y_tolerance=3)
+            lines, cur, cur_top = [], [], None
+            for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
+                if cur_top is None or abs(w["top"] - cur_top) <= 3:
+                    cur.append(w)
+                    if cur_top is None:
+                        cur_top = w["top"]
+                else:
+                    lines.append(cur)
+                    cur, cur_top = [w], w["top"]
+            if cur:
+                lines.append(cur)
+            pages.append(lines)
+    return pages
+
+
+def _line_text(words: list[dict]) -> str:
+    return " ".join(w["text"] for w in words)
+
+
+def _parse_amount_word(tok: str) -> float | None:
+    s = tok.replace("$", "").replace(",", "")
     neg = s.startswith("(") and s.endswith(")")
     s = s.strip("()")
-    if s.startswith("-"):
-        neg = True
-        s = s[1:]
     try:
         v = float(s)
     except ValueError:
@@ -45,92 +69,119 @@ def _parse_amount(raw: str) -> float | None:
     return -v if neg else v
 
 
-def _parse_date(raw: str, hint_year: int | None) -> str | None:
-    parts = raw.split("/")
-    try:
-        m, d = int(parts[0]), int(parts[1])
-        y = int(parts[2]) if len(parts) > 2 else hint_year
-        if y is None:
-            return None
-        if y < 100:
-            y += 2000
-        return datetime(y, m, d).strftime("%Y-%m-%d")
-    except (ValueError, IndexError):
-        return None
+def _classify(amt_word: dict, cx_add, cx_sub, desc: str) -> str:
+    """Column position first; keyword hints only if headers weren't found."""
+    if cx_add is not None and cx_sub is not None:
+        cx = (amt_word["x0"] + amt_word["x1"]) / 2
+        return "credit" if abs(cx - cx_add) < abs(cx - cx_sub) else "debit"
+    d = desc.lower()
+    if any(h in d for h in CREDIT_HINTS):
+        return "credit"
+    if any(h in d for h in DEBIT_HINTS):
+        return "debit"
+    return "debit"
 
 
-def extract_text(pdf_path: str) -> str:
-    import pdfplumber
-
-    chunks = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            chunks.append(page.extract_text() or "")
-    return "\n".join(chunks)
-
-
-def parse_statement(text: str) -> dict:
+def parse_pdf(pdf_path: str) -> dict:
     """Returns {transactions, ending_balance, period_start, period_end}."""
-    # Year hint from statement period, else current year.
-    hint_year = datetime.now().year
-    period_start = period_end = None
-    m = PERIOD_RE.search(text)
+    pages = _positioned_lines(pdf_path)
+    full_text = "\n".join(_line_text(w) for lines in pages for w in lines)
+
+    # Statement year from "July 7, 2026 Page 1 of 7".
+    year = datetime.now().year
+    m = STMT_DATE_RE.search(full_text)
     if m:
         try:
-            period_start = datetime.strptime(m.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
-            period_end = datetime.strptime(m.group(2), "%m/%d/%Y").strftime("%Y-%m-%d")
-            hint_year = int(period_end[:4])
+            year = datetime.strptime(m.group(1), "%B %d, %Y").year
         except ValueError:
             pass
 
-    ending_balance = None
-    m = BALANCE_RE.search(text)
-    if m:
-        ending_balance = _parse_amount(m.group(1))
-
-    transactions = []
-    section = None  # "credit" | "debit" | None
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if DEPOSIT_HDR.search(line):
-            section = "credit"
-            continue
-        if WITHDRAW_HDR.search(line):
-            section = "debit"
-            continue
-        if TX_HISTORY_HDR.search(line):
-            continue
-        for pat in LINE_PATTERNS:
-            mt = pat.match(line)
-            if not mt:
-                continue
-            # Pattern 1: (date, desc, amt); pattern 2: (desc, date, amt)
-            if pat is LINE_PATTERNS[0]:
-                date_raw, desc, amt_raw = mt.group(1), mt.group(2), mt.group(3)
-            else:
-                desc, date_raw, amt_raw = mt.group(1), mt.group(2), mt.group(3)
-            date = _parse_date(date_raw, hint_year)
-            amount = _parse_amount(amt_raw)
-            if date is None or amount is None:
+    # Column anchors from the "Date Number Description Additions Subtractions balance" header.
+    cx_add = cx_sub = None
+    for lines in pages:
+        for words in lines:
+            wl = [w["text"].lower() for w in words]
+            if "additions" in wl and "subtractions" in wl:
+                wa = next(w for w in words if w["text"].lower() == "additions")
+                ws = next(w for w in words if w["text"].lower() == "subtractions")
+                cx_add = (wa["x0"] + wa["x1"]) / 2
+                cx_sub = (ws["x0"] + ws["x1"]) / 2
                 break
-            desc = re.sub(r"\s+", " ", desc).strip()
-            if len(desc) < 3:
-                break
-            kind = section or ("credit" if amount > 0 else "debit")
-            transactions.append(
-                {"date": date, "description": desc, "amount": abs(amount), "kind": kind}
-            )
+        if cx_add is not None:
             break
 
-    # Dedupe exact repeats (multi-page headers can re-print lines).
+    transactions = []
+    for lines in pages:
+        for words in lines:
+            if not words:
+                continue
+            dm = DATE_WORD.match(words[0]["text"])
+            if not dm:
+                continue
+            month, day = int(dm.group(1)), int(dm.group(2))
+            # Trailing run of amount-like words: last = daily balance (drop),
+            # second-to-last = the transaction amount.
+            run = []
+            idx = len(words) - 1
+            while idx > 0 and AMT_WORD.match(words[idx]["text"]):
+                run.append(idx)
+                idx -= 1
+            if not run:
+                continue
+            amt_idx = run[1] if len(run) >= 2 else run[0]
+            amount = _parse_amount_word(words[amt_idx]["text"])
+            if amount is None:
+                continue
+            desc = re.sub(r"\s+", " ", _line_text(words[1:amt_idx])).strip()
+            if len(desc) < 3:
+                continue
+            y = year
+            if len(dm.group(0).split("/")) == 3:  # date carried its own year
+                try:
+                    y = int(dm.group(0).split("/")[2])
+                    if y < 100:
+                        y += 2000
+                except ValueError:
+                    pass
+            try:
+                iso = datetime(y, month, day).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+            kind = _classify(words[amt_idx], cx_add, cx_sub, desc)
+            transactions.append(
+                {"date": iso, "description": desc, "amount": abs(amount), "kind": kind}
+            )
+
+    # Dedupe exact repeats.
     seen, uniq = set(), []
     for t in transactions:
         key = (t["date"], t["description"], t["amount"], t["kind"])
         if key not in seen:
             seen.add(key)
             uniq.append(t)
+
+    ending_balance = None
+    m = BALANCE_RE.search(full_text)
+    if m:
+        ending_balance = _parse_amount_word(m.group(1))
+
+    period_start = period_end = None
+    mb, me = BEGIN_RE.search(full_text), END_RE.search(full_text)
+    if mb and me:
+        try:
+            y2 = year + 1 if int(me.group(1)) < int(mb.group(1)) else year
+            period_start = datetime(year, int(mb.group(1)), int(mb.group(2))).strftime("%Y-%m-%d")
+            period_end = datetime(y2, int(me.group(1)), int(me.group(2))).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    else:
+        m = PERIOD_RE.search(full_text)
+        if m:
+            try:
+                period_start = datetime.strptime(m.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
+                period_end = datetime.strptime(m.group(2), "%m/%d/%Y").strftime("%Y-%m-%d")
+            except ValueError:
+                pass
 
     return {
         "transactions": sorted(uniq, key=lambda t: t["date"]),
